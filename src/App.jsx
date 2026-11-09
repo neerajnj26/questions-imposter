@@ -27,13 +27,11 @@ import {
   RotateCcw, 
   Zap, 
   Sparkles, 
-  ShieldAlert, 
   HelpCircle, 
   CheckCircle2, 
   MessageSquare,
   Crown,
-  Flame,
-  AlertTriangle
+  Flame
 } from 'lucide-react';
 
 // --- Firebase Initialization ---
@@ -245,12 +243,12 @@ export default function App() {
   // --- Auth State ---
   const [user, setUser] = useState(null);
   
-  // --- Screen / Lobby Navigation State ---
-  const [roomCode, setRoomCode] = useState('');
+  // --- Screen / Lobby Navigation State (Initialized from localStorage if available) ---
+  const [roomCode, setRoomCode] = useState(() => localStorage.getItem('imposter_roomCode') || '');
   const [joinCode, setJoinCode] = useState('');
   const [loading, setLoading] = useState(false);
-  const [playerName, setPlayerName] = useState('');
-  const [playerId, setPlayerId] = useState(null);
+  const [playerName, setPlayerName] = useState(() => localStorage.getItem('imposter_playerName') || '');
+  const [playerId, setPlayerId] = useState(() => localStorage.getItem('imposter_playerId') || null);
   const [errorMsg, setErrorMsg] = useState('');
   const [gameState, setGameState] = useState('HOME');
   
@@ -261,6 +259,22 @@ export default function App() {
   const [questionRevealed, setQuestionRevealed] = useState(false);
   const [myAnswer, setMyAnswer] = useState('');
   const [selectedVote, setSelectedVote] = useState('');
+
+  // Sync state changes to localStorage so refreshes remember them
+  useEffect(() => {
+    if (roomCode) localStorage.setItem('imposter_roomCode', roomCode);
+    else localStorage.removeItem('imposter_roomCode');
+  }, [roomCode]);
+
+  useEffect(() => {
+    if (playerName) localStorage.setItem('imposter_playerName', playerName);
+    else localStorage.removeItem('imposter_playerName');
+  }, [playerName]);
+
+  useEffect(() => {
+    if (playerId) localStorage.setItem('imposter_playerId', playerId);
+    else localStorage.removeItem('imposter_playerId');
+  }, [playerId]);
 
   // 1. Firebase Auth Initializer
   useEffect(() => {
@@ -278,7 +292,9 @@ export default function App() {
     initAuth();
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
-      if (u) setPlayerId(u.uid);
+      if (u && !playerId) {
+        setPlayerId(u.uid);
+      }
     });
     return () => unsubscribe();
   }, []);
@@ -303,6 +319,8 @@ export default function App() {
           console.warn(`Room document ${roomCode} not found.`);
           setRoomData(null);
           setErrorMsg("Room closed or does not exist.");
+          // Clear storage if room no longer exists
+          localStorage.removeItem('imposter_roomCode');
         }
       },
       (err) => {
@@ -318,6 +336,11 @@ export default function App() {
   };
 
   const isHost = roomData?.hostId === playerId;
+
+  // Active players filter (ignoring those who left)
+  const playersList = Array.isArray(roomData?.players) 
+    ? roomData.players.filter(p => p && !p.hasLeft) 
+    : [];
 
   // --- ACTIONS ---
 
@@ -370,6 +393,7 @@ export default function App() {
             isImposter: false,
             answer: "",
             votedFor: null,
+            hasLeft: false,
           }
         ],
         currentRound: 0,
@@ -443,6 +467,7 @@ export default function App() {
           isImposter: false,
           answer: "",
           votedFor: null,
+          hasLeft: false,
         }
       ];
 
@@ -463,9 +488,8 @@ export default function App() {
   const handleStartNextRound = async () => {
     if (!roomData || !isHost) return;
 
-    const playersList = Array.isArray(roomData.players) ? roomData.players : [];
     if (playersList.length < 3) {
-      setErrorMsg("You need at least 3 players to start the game!");
+      setErrorMsg("You need at least 3 active players to start the game!");
       return;
     }
 
@@ -562,20 +586,20 @@ export default function App() {
 
     const votes = roomData.votes || {};
     const imposterIds = roomData.imposterIds || [];
-    const players = Array.isArray(roomData.players) ? roomData.players : [];
-    const totalPlayersCount = players.length;
+    const activePlayers = playersList; 
+    const totalPlayersCount = activePlayers.length;
     const isAllImposters = !!roomData.isAllImposters;
+    const activePlayerIds = new Set(activePlayers.map(p => p.id));
 
-    // Tally votes for each player
     const voteCounts = {};
-    players.forEach(p => voteCounts[p.id] = 0);
-    Object.values(votes).forEach(targetId => {
-      if (voteCounts[targetId] !== undefined) {
+    activePlayers.forEach(p => voteCounts[p.id] = 0);
+    
+    Object.entries(votes).forEach(([voterId, targetId]) => {
+      if (activePlayerIds.has(voterId) && voteCounts[targetId] !== undefined) {
         voteCounts[targetId] += 1;
       }
     });
 
-    // Find the player(s) with the highest votes
     let maxVotes = 0;
     Object.values(voteCounts).forEach(count => {
       if (count > maxVotes) maxVotes = count;
@@ -583,37 +607,31 @@ export default function App() {
 
     const topVotedIds = Object.keys(voteCounts).filter(id => voteCounts[id] === maxVotes && maxVotes > 0);
     
-    // Strict Majority Rule Check: > 50% of total players must agree on the target
     const majorityThreshold = Math.floor(totalPlayersCount / 2) + 1;
     const hasTrueMajority = maxVotes >= majorityThreshold && topVotedIds.length === 1;
     const votedOutId = hasTrueMajority ? topVotedIds[0] : null;
     const isImposterCaught = votedOutId ? imposterIds.includes(votedOutId) : false;
 
-    // Update Scores based on Majority Consensus outcome
-    const updatedPlayers = players.map(p => {
+    const updatedPlayers = roomData.players.map(p => {
+      if (p.hasLeft) return p;
+
       const isImposter = imposterIds.includes(p.id);
       let newScore = p.score || 0;
 
       if (isAllImposters) {
-        // In all-imposter rounds, players win points only if they successfully caught someone (or nobody gets majority)
         if (votedOutId && !imposterIds.includes(votedOutId)) {
-          // Majority voted an innocent (none existed), imposters win points
           if (isImposter) newScore += 3;
         } else if (!votedOutId) {
-          // No majority reached -> Imposters escape & win points
           if (isImposter) newScore += 3;
         }
       } else {
-        // Standard / Multi-Imposter rounds
         if (isImposterCaught) {
-          // Majority successfully caught an imposter!
           if (!isImposter) {
-            newScore += 1; // Innocent players who voted correctly get +1 pt
+            newScore += 1;
           }
         } else {
-          // Imposter(s) successfully avoided majority detection or vote tied/failed
           if (isImposter) {
-            newScore += 3; // Imposter gets +3 pts for escaping detection
+            newScore += 3;
           }
         }
       }
@@ -635,7 +653,27 @@ export default function App() {
     });
   };
 
-  const handleLeaveRoom = () => {
+  const handleLeaveRoom = async () => {
+    if (roomCode && playerId && roomData) {
+      try {
+        const roomRef = getRoomRef(roomCode);
+        const fullPlayers = Array.isArray(roomData.players) ? roomData.players : [];
+        const updatedPlayers = fullPlayers.map(p => 
+          p.id === playerId ? { ...p, hasLeft: true } : p
+        );
+
+        await updateDoc(roomRef, {
+          players: updatedPlayers
+        });
+      } catch (err) {
+        console.error("Error leaving room:", err);
+      }
+    }
+
+    // Clear local storage on explicit exit
+    localStorage.removeItem('imposter_roomCode');
+    localStorage.removeItem('imposter_playerName');
+
     setRoomCode('');
     setJoinCode('');
     setRoomData(null);
@@ -643,7 +681,6 @@ export default function App() {
   };
 
   // --- RENDER LOGIC ---
-  const playersList = Array.isArray(roomData?.players) ? roomData.players : [];
   const isImposter = roomData?.imposterIds?.includes(playerId);
   
   let myQuestion = "";
@@ -655,7 +692,9 @@ export default function App() {
     myQuestion = roomData?.questionPair?.majority;
   }
 
-  const totalVotesCount = Object.keys(roomData?.votes || {}).length;
+  const activePlayerIds = new Set(playersList.map(p => p.id));
+  const validVotes = Object.entries(roomData?.votes || {}).filter(([id]) => activePlayerIds.has(id));
+  const totalVotesCount = validVotes.length;
   const allVotesIn = totalVotesCount >= playersList.length && playersList.length > 0;
 
   return (
@@ -856,7 +895,6 @@ export default function App() {
                       "{myQuestion}"
                     </p>
                   </div>
-                  {/* Note: Imposter status warning banner removed per requirement so players don't know they are imposters! */}
                 </div>
               ) : (
                 <div 
@@ -919,7 +957,7 @@ export default function App() {
                 <div className="flex justify-between items-center text-xs text-slate-400 mb-2 font-medium">
                   <span>Submitted Status</span>
                   <span>
-                    {Object.keys(roomData.answers || {}).length} / {playersList.length} Players
+                    {Object.keys(roomData.answers || {}).filter(id => activePlayerIds.has(id)).length} / {playersList.length} Players
                   </span>
                 </div>
                 
@@ -1126,7 +1164,7 @@ export default function App() {
                 </span>
                 <div className="flex flex-wrap items-center justify-center gap-2">
                   {roomData.imposterIds?.map(impId => {
-                    const impPlayer = playersList.find(p => p.id === impId);
+                    const impPlayer = roomData.players?.find(p => p.id === impId);
                     return (
                       <span key={impId} className="text-base sm:text-lg font-black text-white bg-pink-500/30 px-3 py-1 rounded-xl border border-pink-400/50">
                         🚨 {impPlayer?.name || "Unknown"}
@@ -1142,7 +1180,7 @@ export default function App() {
                 </span>
                 {roomData.isAllImposters ? (
                   <div className="space-y-1 pt-1 text-xs text-left">
-                    {playersList.map(p => (
+                    {roomData.players?.map(p => (
                       <div key={p.id} className="text-slate-300 font-medium border-b border-slate-900 pb-1">
                         <strong className="text-purple-400">{p.name}:</strong> "{roomData.customQuestionsMap?.[p.id]}"
                       </div>
